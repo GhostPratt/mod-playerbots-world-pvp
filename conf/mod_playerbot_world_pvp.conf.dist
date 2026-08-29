@@ -40,6 +40,17 @@ PlayerbotWorldPvp.MinOnlineBotsRequired = 3
 # Keep small at first because your current server has a thin 20+ population.
 PlayerbotWorldPvp.MaxBotsPerSide = 8
 
+# Reactive faction defense. A real-player-led outdoor raid wakes existing level-60
+# random bots of the opposite faction and stages them 120 yards away before they
+# advance. The real leader must be PvP flagged; characters are never created,
+# boosted, or otherwise rewritten.
+PlayerbotWorldPvp.ReactiveRaidResponse.Enable = 1
+PlayerbotWorldPvp.ReactiveRaidResponse.MinGroupSize = 20
+PlayerbotWorldPvp.ReactiveRaidResponse.MaxResponders = 40
+PlayerbotWorldPvp.ReactiveRaidResponse.LoginDelaySeconds = 20
+PlayerbotWorldPvp.ReactiveRaidResponse.CooldownSeconds = 1800
+PlayerbotWorldPvp.ReactiveRaidResponse.DurationMinutes = 20
+
 # Audit log.
 PlayerbotWorldPvp.FileLog = 1
 PlayerbotWorldPvp.FileLogPath = Logs/playerbot_world_pvp.log

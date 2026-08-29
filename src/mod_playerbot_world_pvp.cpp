@@ -27,9 +27,15 @@
 #include "Chat.h"
 #include "GameTime.h"
 #include "MotionMaster.h"
+#include "Group.h"
+#include "Map.h"
+#include "RandomPlayerbotMgr.h"
+#include "PlayerbotAI.h"
+#include "Playerbots.h"
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -162,6 +168,31 @@ namespace PlayerbotWorldPvp
     static uint32 BotQueryLimit = 400;
     static uint32 MinOnlineBotsRequired = 3;
     static uint32 GlobalMinLevel = 20;
+
+    static bool ReactiveRaidResponse = true;
+    static uint32 ReactiveMinGroupSize = 20;
+    static uint32 ReactiveMaxResponders = 40;
+    static uint32 ReactiveLoginDelaySeconds = 20;
+    static uint32 ReactiveCooldownSeconds = 1800;
+    static uint32 ReactiveDurationMinutes = 20;
+    static std::string PvpCombatStrategies = "+pvp,+boost,+dps debuff,-passive,-stay";
+    static std::string PvpNonCombatStrategies = "+pvp,+duel,+boost,-passive,-stay";
+    static uint32 _lastReactiveResponse = 0;
+
+    struct PendingRaidResponse
+    {
+        uint32 TriggerGuidLow = 0;
+        TeamSide ResponseTeam = TEAM_SIDE_ANY;
+        uint32 MapId = 0;
+        float TargetX = 0.0f;
+        float TargetY = 0.0f;
+        float TargetZ = 0.0f;
+        float TargetO = 0.0f;
+        uint32 StartAt = 0;
+        std::vector<BotCandidate> Bots;
+    };
+
+    static std::vector<PendingRaidResponse> _pendingRaidResponses;
 
     static bool SameFactionDuels = true;
     static uint32 DuelRequestDelaySeconds = 8;
@@ -460,6 +491,36 @@ namespace PlayerbotWorldPvp
             candidates.push_back(b);
         } while (result->NextRow());
 
+        return candidates;
+    }
+
+    static std::vector<BotCandidate> LoadOfflineCandidates(TeamSide team, uint8 level, std::unordered_set<uint32> const& exclude)
+    {
+        std::vector<BotCandidate> candidates;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT guid,account,name,level,race,class,online FROM characters "
+            "WHERE online=0 AND level={} ORDER BY RAND() LIMIT {}", level, BotQueryLimit);
+        if (!result)
+            return candidates;
+
+        do
+        {
+            Field* f = result->Fetch();
+            BotCandidate b;
+            b.GuidLow = f[0].Get<uint32>();
+            b.AccountId = f[1].Get<uint32>();
+            b.Name = f[2].Get<std::string>();
+            b.Level = f[3].Get<uint8>();
+            b.Race = f[4].Get<uint8>();
+            b.Class = f[5].Get<uint8>();
+            b.Online = false;
+            b.Team = TeamForRace(b.Race);
+            if (exclude.find(b.GuidLow) != exclude.end() || BotActivity::IsReserved(b.GuidLow))
+                continue;
+            if (b.Team != team || !AccountMatchesBotFilter(b.AccountId))
+                continue;
+            candidates.push_back(b);
+        } while (result->NextRow());
         return candidates;
     }
 
@@ -775,6 +836,141 @@ namespace PlayerbotWorldPvp
                 keep.push_back(e);
         }
         _activeEvents.swap(keep);
+    }
+
+    static void StartPendingRaidResponses()
+    {
+        uint32 now = GameTime::GetGameTime().count();
+        std::vector<PendingRaidResponse> keep;
+        for (PendingRaidResponse const& pending : _pendingRaidResponses)
+        {
+            if (pending.StartAt > now)
+            {
+                keep.push_back(pending);
+                continue;
+            }
+
+            ActiveEvent event;
+            event.EventId = _nextEventId++;
+            event.Spot.Name = "Reactive raid response";
+            event.Spot.MapId = pending.MapId;
+            event.StartedAt = now;
+            event.EndsAt = now + ReactiveDurationMinutes * MINUTE;
+            float angle = pending.TargetO + 3.14159265f;
+            uint32 index = 0;
+            for (BotCandidate bot : pending.Bots)
+            {
+                Player* player = FindOnlinePlayer(bot.GuidLow);
+                if (!IsBotSafeToMove(player, bot))
+                    continue;
+
+                bot.Online = true;
+                Participant part;
+                part.Bot = bot;
+                part.Attacker = true;
+                part.OriginalMap = player->GetMapId();
+                part.OriginalX = player->GetPositionX();
+                part.OriginalY = player->GetPositionY();
+                part.OriginalZ = player->GetPositionZ();
+                part.OriginalO = player->GetOrientation();
+                event.Members.push_back(part);
+                BotActivity::Reserve(bot.GuidLow);
+                player->SetPvP(true);
+                if (PlayerbotAI* ai = GET_PLAYERBOT_AI(player))
+                {
+                    ai->ChangeStrategy(PvpCombatStrategies, BOT_STATE_COMBAT);
+                    ai->ChangeStrategy(PvpNonCombatStrategies, BOT_STATE_NON_COMBAT);
+                }
+
+                float lane = static_cast<float>(static_cast<int32>(index % 9) - 4) * 4.0f;
+                float rallyX = pending.TargetX + std::cos(angle) * 120.0f - std::sin(angle) * lane;
+                float rallyY = pending.TargetY + std::sin(angle) * 120.0f + std::cos(angle) * lane;
+                MoveBot(player, pending.MapId, rallyX, rallyY, pending.TargetZ, angle, true);
+                ScheduleMove(event.EventId, bot, pending.MapId,
+                    pending.TargetX + std::cos(angle) * 25.0f + Jitter(),
+                    pending.TargetY + std::sin(angle) * 25.0f + Jitter(),
+                    pending.TargetZ, pending.TargetO, MoveFromRallyDelaySeconds, HardTeleportToTarget);
+                ++index;
+            }
+
+            if (!event.Members.empty())
+            {
+                StatusLog("REACTIVE EVENT #" + std::to_string(event.EventId) + " START responders=" + std::to_string(event.Members.size()));
+                AuditLog("REACTIVE_START", "event=" + std::to_string(event.EventId) + " trigger=" + std::to_string(pending.TriggerGuidLow) +
+                    " team=" + TeamName(pending.ResponseTeam) + " responders=" + std::to_string(event.Members.size()));
+                _activeEvents.push_back(event);
+            }
+        }
+        _pendingRaidResponses.swap(keep);
+    }
+
+    static void TryQueueReactiveRaidResponse()
+    {
+        if (!ReactiveRaidResponse || !_pendingRaidResponses.empty() || _activeEvents.size() >= MaxActiveEvents)
+            return;
+
+        uint32 now = GameTime::GetGameTime().count();
+        if (_lastReactiveResponse && _lastReactiveResponse + ReactiveCooldownSeconds > now)
+            return;
+
+        HashMapHolder<Player>::MapType const& players = ObjectAccessor::GetPlayers();
+        for (auto const& pair : players)
+        {
+            Player* leader = pair.second;
+            if (!leader || !leader->GetSession() || !leader->IsInWorld() || !leader->GetMap() || leader->GetMap()->Instanceable())
+                continue;
+            if (AccountMatchesBotFilter(leader->GetSession()->GetAccountId()))
+                continue;
+            if (!leader->IsPvP())
+                continue;
+            Group* group = leader->GetGroup();
+            if (!group || !group->IsLeader(leader->GetGUID()) || group->GetMembersCount() < ReactiveMinGroupSize)
+                continue;
+
+            TeamSide responseTeam = leader->GetTeamId() == TEAM_ALLIANCE ? TEAM_SIDE_HORDE : TEAM_SIDE_ALLIANCE;
+            uint32 desired = std::min<uint32>(group->GetMembersCount(), ReactiveMaxResponders);
+            std::unordered_set<uint32> excluded;
+            for (ActiveEvent const& event : _activeEvents)
+                for (Participant const& member : event.Members)
+                    excluded.insert(member.Bot.GuidLow);
+
+            std::vector<BotCandidate> responders = LoadCandidates(responseTeam, leader->GetLevel(), 60, excluded);
+            if (responders.size() > desired)
+                responders.resize(desired);
+            for (BotCandidate const& bot : responders)
+                excluded.insert(bot.GuidLow);
+
+            if (responders.size() < desired)
+            {
+                std::vector<BotCandidate> offline = LoadOfflineCandidates(responseTeam, 60, excluded);
+                uint32 need = desired - static_cast<uint32>(responders.size());
+                if (offline.size() > need)
+                    offline.resize(need);
+                for (BotCandidate const& bot : offline)
+                {
+                    responders.push_back(bot);
+                    sRandomPlayerbotMgr.AddPlayerBot(ObjectGuid::Create<HighGuid::Player>(bot.GuidLow), 0);
+                }
+            }
+
+            if (responders.empty())
+                return;
+
+            PendingRaidResponse pending;
+            pending.TriggerGuidLow = leader->GetGUID().GetCounter();
+            pending.ResponseTeam = responseTeam;
+            pending.MapId = leader->GetMapId();
+            pending.TargetX = leader->GetPositionX();
+            pending.TargetY = leader->GetPositionY();
+            pending.TargetZ = leader->GetPositionZ();
+            pending.TargetO = leader->GetOrientation();
+            pending.StartAt = now + ReactiveLoginDelaySeconds;
+            pending.Bots = std::move(responders);
+            _pendingRaidResponses.push_back(std::move(pending));
+            _lastReactiveResponse = now;
+            StatusLog("Queued " + TeamName(responseTeam) + " raid response for " + std::to_string(group->GetMembersCount()) + " invaders.");
+            return;
+        }
     }
 
     static void TryStartRandomEvent()
@@ -1161,6 +1357,14 @@ public:
         BotQueryLimit = sConfigMgr->GetOption<uint32>("PlayerbotWorldPvp.BotQueryLimit", 400);
         MinOnlineBotsRequired = sConfigMgr->GetOption<uint32>("PlayerbotWorldPvp.MinOnlineBotsRequired", 3);
         GlobalMinLevel = sConfigMgr->GetOption<uint32>("PlayerbotWorldPvp.GlobalMinLevel", 20);
+        ReactiveRaidResponse = sConfigMgr->GetOption<bool>("PlayerbotWorldPvp.ReactiveRaidResponse.Enable", true);
+        ReactiveMinGroupSize = sConfigMgr->GetOption<uint32>("PlayerbotWorldPvp.ReactiveRaidResponse.MinGroupSize", 20);
+        ReactiveMaxResponders = sConfigMgr->GetOption<uint32>("PlayerbotWorldPvp.ReactiveRaidResponse.MaxResponders", 40);
+        ReactiveLoginDelaySeconds = sConfigMgr->GetOption<uint32>("PlayerbotWorldPvp.ReactiveRaidResponse.LoginDelaySeconds", 20);
+        ReactiveCooldownSeconds = sConfigMgr->GetOption<uint32>("PlayerbotWorldPvp.ReactiveRaidResponse.CooldownSeconds", 1800);
+        ReactiveDurationMinutes = sConfigMgr->GetOption<uint32>("PlayerbotWorldPvp.ReactiveRaidResponse.DurationMinutes", 20);
+        PvpCombatStrategies = sConfigMgr->GetOption<std::string>("PlayerbotWorldPvp.PvpCombatStrategies", "+pvp,+boost,+dps debuff,-passive,-stay");
+        PvpNonCombatStrategies = sConfigMgr->GetOption<std::string>("PlayerbotWorldPvp.PvpNonCombatStrategies", "+pvp,+duel,+boost,-passive,-stay");
         SameFactionDuels = sConfigMgr->GetOption<bool>("PlayerbotWorldPvp.SameFactionDuels", true);
         DuelRequestDelaySeconds = sConfigMgr->GetOption<uint32>("PlayerbotWorldPvp.DuelRequestDelaySeconds", 8);
         DuelSpellId = sConfigMgr->GetOption<uint32>("PlayerbotWorldPvp.DuelSpellId", 7266);
@@ -1171,6 +1375,8 @@ public:
         EventChancePerTick = std::min<uint32>(EventChancePerTick, 100);
         GlobalMinLevel = std::min<uint32>(std::max<uint32>(GlobalMinLevel, 1), 80);
         MaxBotsPerSide = std::min<uint32>(std::max<uint32>(MaxBotsPerSide, 1), 40);
+        ReactiveMinGroupSize = std::min<uint32>(std::max<uint32>(ReactiveMinGroupSize, 2), 40);
+        ReactiveMaxResponders = std::min<uint32>(std::max<uint32>(ReactiveMaxResponders, 1), 40);
         DuelPairLimit = std::min<uint32>(std::max<uint32>(DuelPairLimit, 1), 40);
         if (TickSeconds == 0)
             TickSeconds = 60;
@@ -1217,10 +1423,12 @@ public:
         ProcessMoveQueue();
         ProcessDuelQueue();
         ExpireEvents();
+        StartPendingRaidResponses();
 
         if (_timerMs <= diff)
         {
             _timerMs = TickSeconds * IN_MILLISECONDS;
+            TryQueueReactiveRaidResponse();
             TryStartRandomEvent();
         }
         else
