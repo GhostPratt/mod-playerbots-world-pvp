@@ -42,9 +42,8 @@
 #include <unordered_set>
 #include <vector>
 
- // Shared cross-module bot reservation (header-only; identical copy shipped in
- // mod-playerbot-dungeon-sim). Lets the two mods coordinate so neither grabs a
- // bot the other is already using — with no link dependency between them.
+// Canonical reservation bus is BotActivityMgr in mod-playerbots.
+// This module is disabled; the include is a compatibility shim.
 #include "BotActivityRegistry.h"
 
 namespace PlayerbotWorldPvp
