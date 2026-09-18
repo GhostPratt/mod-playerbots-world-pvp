@@ -4,7 +4,9 @@
 # Simple autonomous hotspot events: attackers rally outside, move into town/zone target,
 # defenders/responders spawn at the defense point, then the event fizzles out.
 
-PlayerbotWorldPvp.Enable = 1
+# DISABLED: pvp-life is the PvP director. Do not run both. See
+# mod-playerbots/docs/TAKEOVER.md.
+PlayerbotWorldPvp.Enable = 0
 PlayerbotWorldPvp.Debug = 1
 
 # How often the module rolls for a random world-PvP event.
